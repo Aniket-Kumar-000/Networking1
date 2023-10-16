@@ -1,0 +1,376 @@
+from ats import tcl
+from ats import aetest
+from ats.log.utils import banner
+
+from unicon.eal.dialogs import Dialog
+from unicon.eal.dialogs import Statement
+
+import time
+import logging
+import os
+import sys
+import re
+import pdb
+import json
+import pprint
+import socket
+import struct
+import inspect
+import yaml
+import random
+
+from yaml import loader
+from pyats.aetest.steps import Steps
+
+log = logging.getLogger(__name__)
+log.setLevel(logging.DEBUG)
+global uut1           
+global run1 , run2
+
+class ForkedPdb(pdb.Pdb):
+    '''A Pdb subclass that may be used
+    from a forked multiprocessing child1
+    '''
+    def interaction(self, *args, **kwargs):
+        _stdin = sys.stdin
+        try:
+            sys.stdin = open('/dev/stdin')
+            pdb.Pdb.interaction(self, *args, **kwargs)
+        finally:
+            sys.stdin = _stdin
+          
+################################################################################
+####                       COMMON SETUP SECTION                             ####
+################################################################################
+class common_setup(aetest.CommonSetup):
+    @aetest.subsection
+    def Setup(self,testscript,testbed,R1):
+        global uut1
+    
+        global uut_m
+
+        global custom
+        custom = testbed.custom
+
+        uut1=testbed.devices[R1]
+        uut_list=[uut1]
+
+        router_list = [R1]
+        
+    @aetest.subsection
+    def connect_to_devices(self,testscript,testbed,R1):
+        global uut1
+        uut1=testbed.devices[R1]
+        log.info("Connecting to Device...")
+        log.info("%s"%uut1.name)
+        try:
+            uut1.connect()
+            log.info("Connection to %s Successful..."%uut1.name)
+        except Exception as e:
+            log.error("Connection to %s Unsuccessful "\
+                      "Exiting error:%s"%(uut1.name,e))
+            self.failed(goto=['exit'])    
+
+    @aetest.subsection
+    def initialize_logging(self, testscript):
+        global logger
+        logger = logging.getLogger(__name__)
+        logger.setLevel(logging.DEBUG)
+        testscript.parameters['logger'] = logger    
+        
+    @aetest.subsection
+    def server(self,logger,testscript,testbed):
+        global server, server_username, server_pwd, file_path       
+        server = testbed.servers.tftp['address']
+        server_username = testbed.servers.tftp['username']
+        server_pwd = testbed.servers.tftp['password']
+        file_path = testbed.custom['path']
+        chksm = testbed.custom['md5sum']
+        log.info("server = %s"%server)
+        log.info("server_username = %s"%server_username)
+        log.info("server_pwd = %s"%server_pwd)
+        log.info("file_path = %s"%file_path)
+        
+################################################################################
+###                          TESTCASE BLOCK                                  ###
+################################################################################
+class issu(aetest.Testcase):
+    
+    global server, server_username, server_pwd, file_path, run1, run2
+    
+    @aetest.test
+    def version_1(self,testscript,testbed):
+        global run1 , nm
+        log.info(banner("RUNNING CONFIGURATIONS LINE COUNT"))
+        log.info("Running Configs Line Count")
+        cmd = """show running-config | count"""
+        co1 = uut1.execute(cmd)
+        run1 = int(co1)
+        
+        ran = (random.randint(0,100))
+        nm = (f"before_{ran}_upgrade.cfg")
+        testscript.parameters['nm'] = nm
+        
+        uut1.configure("""copy running-config bootflash:%s"""%(nm))
+  
+        # cmd = """show version internal build-identifier"""
+        # output = uut1.execute(cmd)
+        # if ".10.3.2.F.bin" in output:
+        #     log.info("PASSED : This Bug is specified to ISSU from NR2F to Some Image")
+        # else:
+        #     log.error("This Bug is specified to ISSU from NR2F to NR3F Image")
+        #     self.failed(goto=['exit'])
+            
+    @aetest.test
+    def copy_file_from_server(self,testbed,testscript):
+        
+        server = testbed.servers.tftp['address']
+        server_username = testbed.servers.tftp['username']
+        server_pwd = testbed.servers.tftp['password']
+        
+        file_path = testbed.custom['path']
+        file = re.split("/", file_path)
+        file_name = file[(len(file)-1)]
+        chksm = testbed.custom['md5sum']
+        
+        output = uut1.execute(""" dir | grep %s | count """%(file_name))
+        out = int(output)
+        log.info("output = %s",out)
+        
+        if out == 0:
+            log.info("FILE IS NOT PRESENT IN BOOTFLASH = %s"%file_name)
+            log.info(banner("Starting the file copying process"))
+            uut1.transmit("copy scp://%s@%s/%s bootflash:   vr ma use-kstack\r"%(server_username,server,file_path),timeout=3000)
+                         
+            if uut1.receive('Are you sure you want to continue connecting') :
+                uut1.transmit('yes\r')
+                uut1.receive("%s@%s's password:"%(server_username,server))
+                uut1.transmit('%s\r'%(server_pwd),timeout=3000)
+                log.info("Password Taken Successfully...\n")
+                uut1.receive('Copy complete',timeout=3000)
+                log.info("COPY COMPLETED = %s"%file_name)
+                ck = uut1.configure("show file bootflash:/%s md5sum"%(file_name),timeout = 3000)
+                if chksm in ck:
+                   log.info("PASSED : The Checksum Code matched")
+                else:
+                   log.error("Failed : FILE NOT COPIED SUCCESSFULLY")
+                   self.failed(goto=['exit'])
+                   
+            elif uut1.receive("%s@%s's password:"%(server_username,server)):
+                uut1.transmit('%s\r'%(server_pwd),timeout=3000)
+                log.info("Password Taken Successfully...\n")
+                uut1.receive('Copy complete',timeout=3000)
+                log.info("COPY COMPLETED = %s"%file_name)
+                ck = uut1.configure("show file bootflash:/%s md5sum"%(file_name),timeout = 3000)
+                if chksm in ck:
+                   log.info("PASSED : The Checksum Code matched")
+                else:
+                   log.error("Failed : FILE NOT COPIED SUCCESSFULLY")
+                   self.failed(goto=['exit'])
+            else:
+                log.info("No Program prsent for this case")
+                   
+        else:
+            log.info(banner("FILE ALREADY PRESENT IN BOOTLFASH = %s"%file_name))
+            ck = uut1.configure("show file bootflash:/%s md5sum"%(file_name),timeout = 3000)
+            if chksm in ck:
+                    log.info("PASSED : The Checksum Code matched")
+            else:
+                    log.error("Failed : FILE NOT COPIED SUCCESSFULLY")
+                    self.failed(goto=['exit'])
+            
+    @aetest.test
+    def install_file(self,testbed,testscript):
+        un = "%s\r" % testbed.devices[uut1.name].tacacs["username"]
+        add = testbed.servers.tftp["address"]
+        pw = "%s\r" % testbed.devices[uut1.name].passwords["tacacs"]
+        uut1_prompt = ".*%s#.*" % uut1
+        uut1_login_prompt = ".*%s login:.*" % uut1
+        uut1_pw_prompt = ".*[Pp]assword:.*"
+        # uut1.transmit(" \r")
+        uut1.transmit(" \r")
+        uut1.receive(uut1_prompt)
+        
+        file_path = testbed.custom['path']
+        file = re.split("/", file_path)
+        file_name = file[(len(file)-1)]
+        s = testbed.custom['type']
+        issu = int(s)
+        
+        if issu == 1:
+            install_cli = "install all nxos bootflash:%s non-disruptive\r" % file_name
+        else:
+            install_cli = "install all nxos bootflash:%s \r" % file_name
+            
+        uut1.transmit(install_cli,timeout=3000)
+        uut1.receive(".*Do you want to continue with the installation.*|.*Pre-upgrade check failed.*", timeout = 3000)
+        # uut1.receive(".*Do you want to continue with the installation.*|.*Pre-upgrade check failed.*")
+        output = uut1.receive_buffer()
+    
+        match=re.search('.*Image provided does not exist.*|Fail|Error|.*Pre-upgrade check failed.*|.*No such file.*',output,re.DOTALL|re.IGNORECASE)
+        if match:
+            logger.error("Fail to Start ISSU")
+            self.failed(goto=['exit'])
+            
+        match1=re.findall(r'incompatib(?:le|ility)', output,re.DOTALL|re.IGNORECASE)
+        if match1:
+            logger.error("Fail to Start ISSU")
+            self.failed(goto=['exit'])
+        
+        match2=re.search('.*Do you want to continue with the installation.*',output,re.DOTALL|re.IGNORECASE)
+        if match2:
+            logger.info("ISSU almost completed")
+            
+            uut1.transmit("y\r",timeout=3000)
+            uut1.receive("Install has been successful",timeout=3000)
+            log.info("Please wait for few minutes ISSU just now completed")
+            time.sleep(120)
+            log.info(banner("Reload process will take few minutes..."))
+            uut1.configure("copy running-config startup-config",timeout = 300)
+            uut1.transmit("reload\r",timeout = 300)
+            uut1.receive("This command will reboot the system.",timeout = 300)
+            uut1.transmit("y\r",timeout = 300)
+            uut1.receive("login",timeout = 300)
+            uut1.transmit(f"{testbed.tacacs['username']}\r",timeout = 300)
+            uut1.receive("Password",timeout = 300)
+            uut1.transmit(f"{testbed.passwords['tacacs']}\r",timeout = 300)
+            uut1.receive(f"{uut1.name}#",timeout = 300)
+            log.info("Waiting For 3 Minutes")
+            time.sleep(170)
+            print("Coming up...")
+            for i in range(1, 11):
+                print(".", end='', flush=True)
+                time.sleep(1)
+            # log.info("Waiting for device bringup",timeout = 300)
+            # time.sleep(280)
+            # uut1.disconnect()
+            # time.sleep(10)
+            # uut1.connect()
+            # time.sleep(10)
+            
+            # uut1.receive(uut1_login_prompt,timeout=3000)
+            # # uut1.receive(uut1_login_prompt)
+            # uut1.transmit(un,timeout=3000)
+            # # uut1.transmit(un,timeout = 600)
+            # uut1.receive(uut1_pw_prompt,timeout=3000)
+            # # uut1.transmit(pw)
+            # uut1.transmit(pw,timeout=3000)
+            # log.info("Please wait for few minutes ISSU just now completed")
+            # # time.sleep(200)
+            # time.sleep(300)
+            
+            uut1.execute ("show install all failure-reason")
+            out = uut1.execute ("show install all status")
+            match1=re.search('.*Install has been successful.*',out,re.DOTALL|re.IGNORECASE)
+            match2=re.search('.*Finishing the upgrade, switch will reboot.*',out,re.DOTALL|re.IGNORECASE)
+            if match1:
+                log.info("Non-Disruptive ISSU Successfull")
+            elif match2:
+                log.info("Disruptive ISSU Successfull")
+            else:
+                log.error("ISSU unsuccessfull")
+                self.failed()
+                
+    @aetest.test
+    def version_2(self,testbed,testscript):
+        file_path = testbed.custom['path']
+        file = re.split("/", file_path)
+        file_name = file[(len(file)-1)]
+        cmd = """show version internal build-identifier"""
+        output = uut1.execute(cmd)
+        if file_name in output:
+            log.info("PASSED : Image installed successfully")
+        else:
+            log.error("FAILED : Image is not installed")
+            self.failed()
+            
+    @aetest.test
+    def issu_checks(self,testbed,testscript):
+        count = 0
+        uut1.configure("""feature bash-shell""")
+        
+        log.info(banner("CORES"))
+        cmd = """show cores | count"""
+        o = uut1.execute(cmd)
+        if "2" in o :
+            log.info("PASSED : No cores present")   
+        else:
+            log.error("FAILED : Cores are present")
+            count+=1
+        
+        log.info(banner("CC CHECK"))
+        cmd = """show consistency-checker dme running-config enhanced"""
+        u = uut1.execute(cmd,timeout=600)
+        if "PASSED" in u :
+            log.info("PASSED : No Consistency Failure")
+        else:
+            log.error("FAILED : Consistency Failures are present")
+            count+=1
+        
+        log.info(banner("RUNNING CONFIGURATIONS LINE COUNT"))
+        log.info("Running Configs Line Count")
+        cmd = """show running-config | count"""
+        co2 = uut1.execute(cmd)
+        run2 = int(co2)
+        if run1 == run2:
+            log.info(f"Number of Lines before ISSU :- {run1}")
+            log.info(f"Number of Lines after ISSU :- {run2}")
+            log.info("PASSED : Pre-ISSU running Configs are same as Post-ISSU running configs")
+        elif run1 != run2:
+            log.info(f"Number of Lines before ISSU :- {run1}")
+            log.info(f"Number of Lines after ISSU :- {run2}")
+            log.error("Pre-ISSU running Configs are not same as Post-ISSU running configs")
+            log.info("Checking for the features which are ADDED or REMOVED")
+            uut1.execute("sh diff running-config bootflash:%s "%(nm))
+            # OUT = uut1.execute("sh diff running-config bootflash:%s | grep feature "%(nm))
+            # minus = re.findall(r'^- .+', OUT, re.MULTILINE)
+            # plus = re.findall(r'^\+ .+', OUT, re.MULTILINE)
+            # 
+            # log.info("Added Features :")
+            # log.info(minus)
+            # for line in minus:
+            #     log.info(line)
+
+            # log.info("\nMissed Features :")
+            # log.info(plus)
+            # for line in plus:
+            #     log.info(line)
+            # log.info(plus)
+            # time.sleep(5)
+            # count+=1
+        
+        log.info(banner("LOG FILE CHECKS"))
+        cmd = """show logging logfile | i i error"""
+        t = uut1.execute(cmd)
+        if len(t) == 0:
+            log.info("PASSED : There are no log-errors")
+        else:
+            log.error("FAILED : There are some log-errors")
+            count+=1
+            
+        if count == 0:
+            log.info("PASSED")
+            uut1.configure(f"""terminal dont-ask\n delete {nm}\n no terminal dont-ask""")
+        else:
+            log.error("Some Failures in Issu Checks")
+            log.info(f"Number of Checks Failed {count}")
+            uut1.configure(f"""terminal dont-ask\n delete {nm}\n no terminal dont-ask""")
+            self.failed()    
+################################################################################
+####                       COMMON CLEANUP SECTION                           ####
+################################################################################
+class common_cleanup(aetest.CommonCleanup):
+    @aetest.subsection
+    def Clean(self,testscript,testbed,R1):
+        if __name__ == '__main__':
+            import argparse
+            from ats import topology
+            parser = argparse.ArgumentParser(description='standalone parser')
+            parser.add_argument('--testbed', dest='testbed', type=topology.loader.load)
+            parser.add_argument('--R1', dest='R1', type=str)
+            parser.add_argument('--mode',dest = 'mode',type = str)
+            args = parser.parse_known_args()[0]
+            aetest.main(testbed=args.testbed,
+                        R1_name=args.R1,
+                        mode = args.mode,
+                        pdb = True)
